@@ -183,16 +183,16 @@ jobs:
 
           version = sys.argv[1]
           config_path = Path("src-tauri/tauri.conf.json")
-          config = json.loads(config_path.read_text())
+          config = json.loads(config_path.read_text(encoding="utf-8"))
           config["version"] = version
           config["plugins"]["updater"]["endpoints"] = [
               f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/latest/download/latest.json"
           ]
-          config_path.write_text(json.dumps(config, indent=2) + "\n")
+          config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
           cargo_path = Path("src-tauri/Cargo.toml")
-          cargo = cargo_path.read_text()
-          cargo_path.write_text(re.sub(r'(?m)^version = "[^"]+"$', f'version = "{version}"', cargo, count=1))
+          cargo = cargo_path.read_text(encoding="utf-8")
+          cargo_path.write_text(re.sub(r'(?m)^version = "[^"]+"$', f'version = "{version}"', cargo, count=1), encoding="utf-8")
           PY
 
       - name: Install frontend dependencies
@@ -262,12 +262,32 @@ jobs:
 
           echo "key_path=$KEY_PATH" >> "$GITHUB_OUTPUT"
 
+      - name: Normalize updater signing key
+        shell: bash
+        env:
+          RAW_TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          python - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+
+          key = "".join(os.environ["RAW_TAURI_SIGNING_PRIVATE_KEY"].split())
+          if not key:
+              raise SystemExit("TAURI_SIGNING_PRIVATE_KEY is empty")
+          try:
+              base64.b64decode(key, validate=True)
+          except ValueError as exc:
+              raise SystemExit(f"TAURI_SIGNING_PRIVATE_KEY is not valid Base64: {exc}")
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as output:
+              output.write(f"TAURI_SIGNING_PRIVATE_KEY={key}\n")
+          PY
+
       - name: Build and publish Windows release
         if: runner.os == 'Windows'
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: .
@@ -288,7 +308,6 @@ jobs:
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -314,7 +333,6 @@ jobs:
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPLE_SIGNING_IDENTITY: "-"
         with:
