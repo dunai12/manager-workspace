@@ -2,13 +2,13 @@
 
 ## Публикация
 
-- Публичный репозиторий: `https://github.com/dunai12/manager-workspace`, основная ветка `main`.
+- Публичный репозиторий: `https://github.com/dunai12/manager-workspace`, основная ветка `master`.
 - Добавлена лицензия MIT. История коммитов использует GitHub no-reply адрес вместо рабочего email.
 - Локальные данные, секреты и сборочные артефакты не входят в Git.
 
 ## Этап A — каркас
 
-- Создана структура Tauri 2 + React/TypeScript + Rust, Git с веткой `main` и `.gitignore` для локальных данных, секретов и артефактов.
+- Создана структура Tauri 2 + React/TypeScript + Rust, Git с веткой `master` и `.gitignore` для локальных данных, секретов и артефактов.
 - Добавлены README, PRODUCT, ARCHITECTURE и правила в AGENTS.md.
 - `npm run build`, `npm test` и `npm run desktop:build` прошли. Собран `.app` для macOS, окно приложения открыто и проверено.
 - Исправлен запуск для терминала, где Cargo ещё не добавлен в `PATH`: npm-скрипты находят стандартный `~/.cargo/bin`. Команда `npm run desktop` без дополнительных переменных окружения повторно проверена: Vite запустился, Rust собрался, Tauri запустил приложение. После проверки тестовый процесс остановлен.
