@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "Доступ главного окна к локальным командам приложения",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

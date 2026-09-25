@@ -1,0 +1,11 @@
+{
+  "id": "prepare-digest",
+  "version": "0.1.0",
+  "purpose": "Подготовить проверяемый дайджест из нормализованного контекста",
+  "inputs": ["source_records", "task_links", "task_states"],
+  "outputs": ["digest_markdown", "claims", "task_proposals"],
+  "allowedSources": ["enabled_read_only_adapters"],
+  "allowedActions": [],
+  "implementation": "deterministic_fake_v1",
+  "checks": ["Каждое утверждение имеет идентификатор источника", "Завершённые связанные задачи не предлагаются повторно", "Неизвестное состояние задачи не объявляется открытым или закрытым"]
+}
