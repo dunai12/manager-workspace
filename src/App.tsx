@@ -2,6 +2,9 @@ import { useEffect, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { bridge } from './bridge';
 import type { AppState, Settings, TaskSelection } from './types';
+import type { Update } from '@tauri-apps/plugin-updater';
+import { allReleaseNotes, releaseNotesSince, type ReleaseNote } from './release-notes';
+import { checkForUpdate, installUpdate, markReleaseNotesSeen, releaseNotesState } from './updates';
 
 type Page = 'digest' | 'sources' | 'tasks' | 'settings';
 
@@ -18,11 +21,83 @@ function App() {
   const [selected, setSelected] = useState<string[]>([]);
   const [titles, setTitles] = useState<Record<string, string>>({});
   const [preview, setPreview] = useState(false);
+  const [update, setUpdate] = useState<Update | null>(null);
+  const [dismissedUpdate, setDismissedUpdate] = useState<string | null>(() => {
+    try { return localStorage.getItem('manager-workspace.dismissed-update'); } catch { return null; }
+  });
+  const [updating, setUpdating] = useState(false);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [releaseNotes, setReleaseNotes] = useState<ReleaseNote[]>([]);
+  const [notesOpen, setNotesOpen] = useState(false);
+  const [autoNotes, setAutoNotes] = useState(false);
 
   useEffect(() => {
     bridge.getState().then(state => { setAppState(state); setSettings(state.settings); })
       .catch(e => setError(String(e)));
   }, []);
+
+  useEffect(() => {
+    if (import.meta.env.DEV) return;
+    let active = true;
+    void releaseNotesState().then(({ currentVersion, lastSeenVersion }) => {
+      if (!active) return;
+      const notes = releaseNotesSince(lastSeenVersion, currentVersion);
+      if (notes.length) {
+        setReleaseNotes(notes);
+        setAutoNotes(true);
+        setNotesOpen(true);
+      }
+    }).catch(() => {});
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    if (import.meta.env.DEV) return;
+    let active = true;
+    const check = () => void checkForUpdate().then(result => {
+      if (active) setUpdate(result);
+    }).catch(() => {});
+    check();
+    const timer = window.setInterval(check, 24 * 60 * 60 * 1000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, []);
+
+  const closeNotes = () => {
+    setNotesOpen(false);
+    if (autoNotes) void markReleaseNotesSeen().catch(() => {});
+    setAutoNotes(false);
+  };
+
+  useEffect(() => {
+    if (!notesOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') closeNotes(); };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [notesOpen, autoNotes]);
+
+  const checkUpdateNow = async () => {
+    setCheckingUpdate(true);
+    try {
+      const result = await checkForUpdate();
+      setUpdate(result);
+      setNotice(result ? `Доступна версия ${result.version}.` : 'Установлена актуальная версия.');
+    } catch {
+      setError('Не удалось проверить обновления. Повторите попытку позже.');
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+
+  const startUpdate = async () => {
+    if (!update) return;
+    setUpdating(true);
+    try {
+      await installUpdate(update);
+    } catch {
+      setError('Не удалось установить обновление. Повторите попытку позже.');
+      setUpdating(false);
+    }
+  };
 
   const act = async (job: () => Promise<AppState>, success: string | ((state: AppState) => string)) => {
     if (busy) return;
@@ -166,11 +241,19 @@ function App() {
           </div>
           <div className="section-head"><h2>AI-провайдер</h2></div>
           <div className="card settings-card"><div className="setting-row"><span><strong>Провайдер</strong><small>Внешние модели в этом срезе не вызываются</small></span><select aria-label="AI-провайдер" value={settings.aiProvider} disabled><option value="fake">Fake</option></select></div><div className="setting-row"><span><strong>Модель</strong><small>Детерминированная логика skill</small></span><select aria-label="Модель" value={settings.aiModel} disabled><option value="deterministic-v1">deterministic-v1</option></select></div></div>
+          <div className="section-head"><h2>Версия приложения</h2></div>
+          <div className="card settings-card">
+            {allReleaseNotes().length > 0 && <div className="setting-row"><span><strong>Что нового</strong><small>Изменения в опубликованных версиях</small></span><button className="secondary-button" onClick={() => { setReleaseNotes(allReleaseNotes()); setAutoNotes(false); setNotesOpen(true); }}>Посмотреть</button></div>}
+            <div className="setting-row"><span><strong>Обновления</strong><small>Проверка доступной версии</small></span><button className="secondary-button" disabled={checkingUpdate} onClick={() => void checkUpdateNow()}>{checkingUpdate ? 'Проверка…' : 'Проверить обновления'}</button></div>
+            {update && <div className="setting-row"><span><strong>Доступна версия {update.version}</strong><small>Установка начнётся после подтверждения</small></span><button className="primary-button" disabled={updating} onClick={() => void startUpdate()}>{updating ? 'Обновление…' : 'Обновить'}</button></div>}
+          </div>
           <div className="settings-actions"><button className="primary-button" disabled={busy} onClick={save}>Сохранить настройки</button></div>
           <div className="future-note"><strong>Следующие этапы</strong><p>Почтовые аккаунты с разными способами подключения; Todoist MCP с проверкой истории завершений; затем произвольные MCP-серверы Jira и Confluence, выбор Telegram-чатов и новые skills.</p></div>
         </>}
       </div>
     </main>
+    {update && dismissedUpdate !== update.version && <div className="update-banner" role="status"><div><strong>Доступна новая версия {update.version}</strong><p>Обновление установится только после вашего нажатия.</p></div><div className="update-actions"><button className="secondary-button" disabled={updating} onClick={() => { setDismissedUpdate(update.version); try { localStorage.setItem('manager-workspace.dismissed-update', update.version); } catch { /* dismissal still lasts for this session */ } }}>Позже</button><button className="primary-button" disabled={updating} onClick={() => void startUpdate()}>{updating ? 'Обновление…' : 'Обновить'}</button></div></div>}
+    {notesOpen && releaseNotes.length > 0 && <div className="dialog-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) closeNotes(); }}><div className="release-dialog" role="dialog" aria-modal="true" aria-label="Что нового"><h2>Что нового</h2><div className="release-dialog-content">{releaseNotes.map(release => <section key={release.version}><h3>Версия {release.version}</h3><ul>{release.entries.map((entry, index) => <li key={index}>{entry.ru}</li>)}</ul></section>)}</div><button className="primary-button" onClick={closeNotes}>Готово</button></div></div>}
   </div>;
 }
 
