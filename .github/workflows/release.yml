@@ -1,0 +1,413 @@
+name: Publish manager-workspace
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump type for automatic calculation"
+        required: false
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+      version:
+        description: "Optional explicit SemVer; overrides automatic version calculation"
+        required: false
+        type: string
+  push:
+    branches:
+      - master
+    paths:
+      - "src/**"
+      - "src-tauri/**"
+      - "public/**"
+      - "index.html"
+      - "package.json"
+      - "package-lock.json"
+      - "vite.config.ts"
+      - "tsconfig*.json"
+      - "CHANGELOG.md"
+      - "scripts/**"
+
+concurrency:
+  group: publish-manager-workspace
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare_release:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release_version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Calculate SemVer
+        id: release_version
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+          BUMP_KIND: ${{ inputs.bump || 'patch' }}
+        run: |
+          git fetch --tags --force
+          BASE_VERSION=$(node -p "require('./package.json').version")
+          if [ -n "$REQUESTED_VERSION" ]; then
+            VERSION="$REQUESTED_VERSION"
+          else
+            VERSION=$(python - "$BASE_VERSION" "$BUMP_KIND" <<'PY'
+          import re
+          import subprocess
+          import sys
+
+          base = sys.argv[1]
+          bump_kind = sys.argv[2]
+          versions = []
+          for tag in subprocess.check_output(["git", "tag", "--list", "manager-workspace-v*"], text=True).splitlines():
+              match = re.fullmatch(r"manager-workspace-v(\d+)\.(\d+)\.(\d+)", tag)
+              if match:
+                  versions.append(tuple(map(int, match.groups())))
+          if not versions:
+              print(base)
+          else:
+              major, minor, patch = max(versions)
+              if bump_kind == "minor":
+                  print(f"{major}.{minor + 1}.0")
+              else:
+                  print(f"{major}.{minor}.{patch + 1}")
+          PY
+            )
+          fi
+          python - "$VERSION" <<'PY'
+          import re
+          import sys
+          if not re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", sys.argv[1]):
+              raise SystemExit("Release version must be valid SemVer")
+          PY
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release notes
+        run: node scripts/build-release-notes.mjs "${{ steps.release_version.outputs.version }}"
+
+      - name: Verify updater signing secret
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        shell: bash
+        run: test -n "$TAURI_SIGNING_PRIVATE_KEY"
+
+  publish_tauri:
+    name: Build ${{ matrix.name }}
+    needs: prepare_release
+    permissions:
+      contents: write
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      # tauri-action updates one shared latest.json asset. Serializing the
+      # matrix prevents concurrent delete/upload races between platforms.
+      max-parallel: 1
+      matrix:
+        include:
+          - name: macOS Apple Silicon
+            platform: macos-latest
+            target: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin --bundles app,dmg
+          - name: macOS Intel
+            platform: macos-latest
+            target: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin --bundles app,dmg
+          - name: Windows x64
+            platform: windows-latest
+            target: ''
+            args: ''
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install requested Rust target
+        if: matrix.target != ''
+        shell: bash
+        run: |
+          rustup target add "${{ matrix.target }}"
+          rustup target list --installed
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+
+      - name: Set release version and updater endpoint
+        shell: bash
+        env:
+          MANAGER_WORKSPACE_VERSION: ${{ needs.prepare_release.outputs.version }}
+        run: |
+          BASE_VERSION=$(node -p "require('./package.json').version")
+          if [ "$BASE_VERSION" != "$MANAGER_WORKSPACE_VERSION" ]; then
+            npm version --no-git-tag-version --ignore-scripts "$MANAGER_WORKSPACE_VERSION"
+          fi
+          python - "$MANAGER_WORKSPACE_VERSION" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          version = sys.argv[1]
+          config_path = Path("src-tauri/tauri.conf.json")
+          config = json.loads(config_path.read_text())
+          config["version"] = version
+          config["plugins"]["updater"]["endpoints"] = [
+              f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/latest/download/latest.json"
+          ]
+          config_path.write_text(json.dumps(config, indent=2) + "\n")
+
+          cargo_path = Path("src-tauri/Cargo.toml")
+          cargo = cargo_path.read_text()
+          cargo_path.write_text(re.sub(r'(?m)^version = "[^"]+"$', f'version = "{version}"', cargo, count=1))
+          PY
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Bundle release notes
+        shell: bash
+        run: node scripts/build-release-notes.mjs "${{ needs.prepare_release.outputs.version }}"
+
+      - name: Select macOS signing mode
+        id: macos_signing
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            echo "mode=ad-hoc" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "$APPLE_CERTIFICATE_PASSWORD" ]; then
+            echo "::error::APPLE_CERTIFICATE is set but APPLE_CERTIFICATE_PASSWORD is empty."
+            exit 1
+          fi
+
+          echo "mode=developer-id" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare App Store Connect notarization key
+        id: apple_notarization
+        if: runner.os == 'macOS' && steps.macos_signing.outputs.mode == 'developer-id'
+        shell: bash
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_PRIVATE_KEY_BASE64: ${{ secrets.APPLE_API_PRIVATE_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$APPLE_API_KEY" ] || [ -z "$APPLE_API_ISSUER" ] || [ -z "$APPLE_API_PRIVATE_KEY_BASE64" ]; then
+            echo "::error::APPLE_API_KEY, APPLE_API_ISSUER and APPLE_API_PRIVATE_KEY_BASE64 are required for Developer ID notarization."
+            exit 1
+          fi
+
+          KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          export KEY_PATH
+          python3 - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+
+          value = os.environ["APPLE_API_PRIVATE_KEY_BASE64"]
+          path = Path(os.environ["KEY_PATH"])
+          try:
+              decoded = base64.b64decode(value, validate=True)
+          except Exception as exc:
+              raise SystemExit(f"APPLE_API_PRIVATE_KEY_BASE64 is not valid Base64: {exc}")
+          lines = decoded.splitlines()
+          if not lines or b"PRIVATE KEY" not in lines[0]:
+              raise SystemExit("Decoded App Store Connect key is not a PEM private key")
+          path.write_bytes(decoded)
+          path.chmod(0o600)
+          if path.stat().st_size == 0:
+              raise SystemExit("Decoded App Store Connect key is empty")
+          PY
+
+          echo "key_path=$KEY_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Build and publish Windows release
+        if: runner.os == 'Windows'
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: .
+          tagName: manager-workspace-v__VERSION__
+          releaseName: manager-workspace v__VERSION__
+          releaseBody: |
+            Release build for macOS and Windows.
+
+            macOS signing is selected automatically: Developer ID plus notarization when Apple certificate and App Store Connect API secrets are configured; ad-hoc only when APPLE_CERTIFICATE is empty. Incomplete signing or notarization credentials fail the macOS job.
+
+            macOS DMG assets are provided for convenient installation.
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
+
+      - name: Build and publish signed macOS release
+        if: runner.os == 'macOS' && steps.macos_signing.outputs.mode == 'developer-id'
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_PATH: ${{ steps.apple_notarization.outputs.key_path }}
+        with:
+          projectPath: .
+          tagName: manager-workspace-v__VERSION__
+          releaseName: manager-workspace v__VERSION__
+          releaseBody: |
+            Release build for macOS and Windows.
+
+            macOS signing is selected automatically: Developer ID plus notarization when Apple certificate and App Store Connect API secrets are configured; ad-hoc only when APPLE_CERTIFICATE is empty. Incomplete signing or notarization credentials fail the macOS job.
+
+            macOS DMG assets are provided for convenient installation.
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
+
+      - name: Build and publish ad-hoc macOS release
+        if: runner.os == 'macOS' && steps.macos_signing.outputs.mode == 'ad-hoc'
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: "-"
+        with:
+          projectPath: .
+          tagName: manager-workspace-v__VERSION__
+          releaseName: manager-workspace v__VERSION__
+          releaseBody: |
+            Release build for macOS and Windows.
+
+            macOS signing is selected automatically: Developer ID plus notarization when Apple certificate and App Store Connect API secrets are configured; ad-hoc only when APPLE_CERTIFICATE is empty. Incomplete signing or notarization credentials fail the macOS job.
+
+            macOS DMG assets are provided for convenient installation.
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
+
+  publish_release:
+    name: Publish complete release
+    needs:
+      - prepare_release
+      - publish_tauri
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      RELEASE_TAG: manager-workspace-v${{ needs.prepare_release.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Generate release notes
+        run: node scripts/build-release-notes.mjs "${{ needs.prepare_release.outputs.version }}"
+
+      - name: Download updater manifest
+        shell: bash
+        run: gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern latest.json
+
+      - name: Verify updater manifest is complete
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          manifest = json.loads(Path("latest.json").read_text())
+          platforms = manifest.get("platforms", {})
+          required = {"darwin-aarch64", "darwin-x86_64", "windows-x86_64"}
+          missing = sorted(required - platforms.keys())
+          if missing:
+              raise SystemExit(f"latest.json is missing required platforms: {', '.join(missing)}")
+          PY
+
+      - name: Add release notes to updater manifest
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("latest.json")
+          manifest = json.loads(path.read_text())
+          manifest["notes"] = Path(".release/update-notes.txt").read_text().strip()
+          path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+          PY
+          gh release upload "$RELEASE_TAG" latest.json --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Publish release
+        shell: bash
+        run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes-file .release/release-body.md --draft=false
+
+  cleanup_failed_release:
+    name: Cleanup failed release
+    needs:
+      - prepare_release
+      - publish_tauri
+      - publish_release
+    if: ${{ always() && needs.prepare_release.result == 'success' && (needs.publish_tauri.result != 'success' || needs.publish_release.result != 'success') }}
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      RELEASE_TAG: manager-workspace-v${{ needs.prepare_release.outputs.version }}
+    steps:
+      - name: Delete incomplete release and tag
+        shell: bash
+        run: |
+          gh release delete "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --yes \
+            --cleanup-tag || true

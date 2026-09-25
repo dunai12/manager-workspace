@@ -99,6 +99,8 @@ struct AppState {
     latest_run: Option<Run>,
     task_links: Vec<TaskLink>,
     action_journal: Vec<ActionEntry>,
+    #[serde(default)]
+    last_seen_release_version: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -148,7 +150,43 @@ fn validate_settings(settings: &Settings) -> Result<(), String> {
 #[tauri::command]
 fn get_state(app: tauri::AppHandle, lock: tauri::State<StoreLock>) -> Result<AppState, String> {
     let _guard = lock.0.lock().map_err(|e| e.to_string())?;
-    read_state(&app)
+    let mut state = read_state(&app)?;
+    if state.last_seen_release_version.is_none() {
+        state.last_seen_release_version = Some(app.package_info().version.to_string());
+        write_state(&app, &state)?;
+    }
+    Ok(state)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReleaseNotesState {
+    current_version: String,
+    last_seen_version: String,
+}
+
+#[tauri::command]
+fn release_notes_state(app: tauri::AppHandle, lock: tauri::State<StoreLock>) -> Result<ReleaseNotesState, String> {
+    let _guard = lock.0.lock().map_err(|e| e.to_string())?;
+    let mut state = read_state(&app)?;
+    let current_version = app.package_info().version.to_string();
+    let last_seen_version = match state.last_seen_release_version {
+        Some(version) => version,
+        None => {
+            state.last_seen_release_version = Some(current_version.clone());
+            write_state(&app, &state)?;
+            current_version.clone()
+        }
+    };
+    Ok(ReleaseNotesState { current_version, last_seen_version })
+}
+
+#[tauri::command]
+fn mark_release_notes_seen(app: tauri::AppHandle, lock: tauri::State<StoreLock>) -> Result<(), String> {
+    let _guard = lock.0.lock().map_err(|e| e.to_string())?;
+    let mut state = read_state(&app)?;
+    state.last_seen_release_version = Some(app.package_info().version.to_string());
+    write_state(&app, &state)
 }
 
 #[tauri::command]
@@ -383,8 +421,10 @@ fn apply_selections(state: &mut AppState, selections: Vec<TaskSelection>, now: &
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(StoreLock(Mutex::new(())))
-        .invoke_handler(tauri::generate_handler![get_state, save_settings, collect_context, create_tasks])
+        .invoke_handler(tauri::generate_handler![get_state, save_settings, collect_context, create_tasks, release_notes_state, mark_release_notes_seen])
         .run(tauri::generate_context!())
         .expect("failed to start app");
 }

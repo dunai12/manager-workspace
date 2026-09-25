@@ -3,5 +3,5 @@
   "identifier": "main-window",
   "description": "Доступ главного окна к локальным командам приложения",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "updater:default", "process:default"]
 }
